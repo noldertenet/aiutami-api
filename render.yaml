@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: aiutami-api
+    env: python
+    plan: free
+    buildCommand: |
+      apt-get update && apt-get install -y tesseract-ocr tesseract-ocr-ita && pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: AIUTAMI_DB_URL
+        value: "sqlite:///./aiutami.db"
+      - key: AIUTAMI_STARTING_CREDITS
+        value: "1"
+      - key: AIUTAMI_CREDIT_COST
+        value: "1"
