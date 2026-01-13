@@ -1,19 +1,17 @@
 import os
-import json
-from fastapi import Header
-from pydantic import BaseModel
-from .admin import require_admin, topup_credits
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Header
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from openai import OpenAI
+from pydantic import BaseModel
 
 from .models import Base, Request
-from .credits import get_or_create_user, ensure_can_spend, spend, COST_CREDITS
+from .credits import get_or_create_user, ensure_can_spend, spend, COST_CREDITS, normalize_phone
 from .ocr import ocr_image_bytes
 from .aiutami_prompt import SYSTEM_PROMPT
 from .pdf_utils import extract_text_from_pdf_bytes, render_pdf_pages_to_images
+from .admin import require_admin, topup_credits
 
 
 DB_URL = os.getenv("AIUTAMI_DB_URL", "sqlite:///./aiutami.db")
@@ -27,6 +25,7 @@ SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False)
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="AIutaMI API MVP")
+
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 CREDITS_FINISHED_MSG = (
@@ -42,7 +41,7 @@ BLOCKED_MSG = (
 
 @app.get("/")
 def root():
-    return {"service": "AIutaMI API", "health": "/health", "analyze": "/analyze"}
+    return {"service": "AIutaMI API", "status": "running"}
 
 
 @app.get("/health")
@@ -50,95 +49,116 @@ def health():
     return {"ok": True}
 
 
-@app.post("/analyze")
-async def analyze(
-    phone: str = Form(..., description="Numero utente es. +39333..."),
-    image: UploadFile = File(...),
-):
-    allowed = ("image/jpeg", "image/png", "image/jpg", "image/webp", "application/pdf")
-    if image.content_type not in allowed:
-        raise HTTPException(
-            status_code=400,
-            detail="Formato non supportato. Invia una foto oppure un PDF."
-        )
-
-    file_bytes = await image.read()
-    if len(file_bytes) > 15 * 1024 * 1024:
-        raise HTTPException(status_code=400, detail="File troppo grande (max 15MB).")
-
+@app.get("/credits")
+def credits(phone: str):
     db = SessionLocal()
     try:
-        user = get_or_create_user(db, phone)
+        phone_n = normalize_phone(phone)
+        user = get_or_create_user(db, phone_n)
+        return {"ok": True, "phone": user.phone, "credits": user.credits}
+    finally:
+        db.close()
 
-        try:
-            ensure_can_spend(user, COST_CREDITS)
-        except PermissionError:
-            return {"ok": False, "message": BLOCKED_MSG, "credits": user.credits}
-        except ValueError:
+
+@app.post("/analyze")
+async def analyze(
+    phone: str = Form(...),
+    image: UploadFile = File(...),
+):
+    db = SessionLocal()
+    try:
+        phone_n = normalize_phone(phone)
+        user = get_or_create_user(db, phone_n)
+
+        if not ensure_can_spend(user, COST_CREDITS):
             return {"ok": False, "message": CREDITS_FINISHED_MSG, "credits": user.credits}
 
+        raw = await image.read()
+        ctype = (image.content_type or "").lower()
+        filename = (image.filename or "").lower()
+
+        extracted_text = ""
         ocr_text = ""
+        text_for_ai = ""
 
-        if image.content_type == "application/pdf":
-            ocr_text = extract_text_from_pdf_bytes(file_bytes, max_pages=3)
+        is_pdf = ("pdf" in ctype) or filename.endswith(".pdf")
 
-            if len(ocr_text) < 30:
-                pages = render_pdf_pages_to_images(file_bytes, max_pages=2, dpi=220)
-                texts = []
-                for p in pages:
-                    t = ocr_image_bytes(p)
-                    if t and len(t) > 10:
-                        texts.append(t)
-                ocr_text = "\n\n".join(texts).strip()
+        if is_pdf:
+            extracted_text = (extract_text_from_pdf_bytes(raw) or "").strip()
+
+            if not extracted_text:
+                # OCR fallback: render first 2 pages to images and OCR them
+                pages = render_pdf_pages_to_images(raw, max_pages=2, dpi=200)
+                if not pages:
+                    return {
+                        "ok": False,
+                        "message": "Non riesco a leggere il PDF. Prova a caricarlo di nuovo oppure invia una foto più nitida.",
+                        "credits": user.credits
+                    }
+
+                ocr_chunks = []
+                for img_bytes in pages:
+                    t = (ocr_image_bytes(img_bytes) or "").strip()
+                    if t:
+                        ocr_chunks.append(t)
+                ocr_text = "\n\n".join(ocr_chunks).strip()
+
+            text_for_ai = extracted_text if extracted_text else ocr_text
+
+            if not text_for_ai:
+                return {
+                    "ok": False,
+                    "message": "Non riesco a leggere bene il testo dal PDF. Prova a inviarlo più nitido o in un formato diverso.",
+                    "credits": user.credits,
+                    "extracted_text": extracted_text,
+                    "ocr_text": ocr_text
+                }
+
         else:
-            ocr_text = ocr_image_bytes(file_bytes)
+            ocr_text = (ocr_image_bytes(raw) or "").strip()
+            if not ocr_text:
+                return {
+                    "ok": False,
+                    "message": "Non riesco a leggere bene il testo dalla foto. Prova a rifarla più ravvicinata e con più luce.",
+                    "credits": user.credits,
+                    "ocr_text": ocr_text
+                }
+            text_for_ai = ocr_text
 
-        if len(ocr_text) < 30:
-            return {
-                "ok": False,
-                "message": (
-                    "Non riesco a leggere bene il testo.\n"
-                    "Se hai il PDF originale, invialo come documento (è meglio della foto).\n"
-                    "Altrimenti rifai la foto più ravvicinata, dritta e con più luce (prima pagina completa)."
-                ),
-                "credits": user.credits,
-                "ocr_text": ocr_text,
-            }
-
-        req = Request(
-            user_id=user.id,
-            ocr_text=ocr_text,
-            status="draft",
-            cost_credits=COST_CREDITS
-        )
-        db.add(req)
-        db.commit()
-        db.refresh(req)
-
-        resp = client.chat.completions.create(
+        # OpenAI analysis
+        completion = client.chat.completions.create(
             model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": f"Testo estratto:\n\n{ocr_text}\n\nRispondi nel JSON richiesto."},
+                {"role": "user", "content": text_for_ai}
             ],
-            temperature=0.2,
-            response_format={"type": "json_object"},
+            temperature=0.2
         )
+        ai_response = completion.choices[0].message.content
 
-        data = json.loads(resp.choices[0].message.content)
+        # Spend credits
+        spend(db, user, COST_CREDITS)
 
-        req.categoria = data.get("categoria")
-        req.rischio = data.get("rischio")
-        req.response_whatsapp = data.get("risposta_whatsapp")
+        # Log request
+        req = Request(
+            phone=user.phone,
+            raw_text=text_for_ai,
+            response=ai_response
+        )
         db.add(req)
         db.commit()
 
-        spend(db, user, COST_CREDITS, req.id)
-
-        return {"ok": True, "credits": user.credits, "ocr_text": ocr_text, "result": data}
+        return {
+            "ok": True,
+            "result": ai_response,
+            "credits": user.credits,
+            "source": "pdf-text" if extracted_text else ("pdf-ocr" if is_pdf else "image-ocr")
+        }
 
     finally:
         db.close()
+
+
 class TopupBody(BaseModel):
     phone: str
     amount: int
@@ -151,15 +171,15 @@ def admin_topup(
 ):
     require_admin(x_aiutami_admin)
 
-    phone = payload.phone.strip()
+    phone_n = normalize_phone(payload.phone)
     amount = int(payload.amount)
 
-    if not phone or amount <= 0:
+    if not phone_n or amount <= 0:
         raise HTTPException(status_code=400, detail="Parametri non validi")
 
     db = SessionLocal()
     try:
-        user = topup_credits(db, phone, amount)
+        user = topup_credits(db, phone_n, amount)
         return {"ok": True, "phone": user.phone, "credits": user.credits}
     finally:
         db.close()
