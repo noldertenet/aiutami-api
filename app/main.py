@@ -1,5 +1,8 @@
 import os
 import json
+from fastapi import Header
+from pydantic import BaseModel
+from .admin import require_admin, topup_credits
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from sqlalchemy import create_engine
@@ -134,5 +137,29 @@ async def analyze(
 
         return {"ok": True, "credits": user.credits, "ocr_text": ocr_text, "result": data}
 
+    finally:
+        db.close()
+class TopupBody(BaseModel):
+    phone: str
+    amount: int
+
+
+@app.post("/admin/topup")
+def admin_topup(
+    payload: TopupBody,
+    x_aiutami_admin: str | None = Header(default=None),
+):
+    require_admin(x_aiutami_admin)
+
+    phone = payload.phone.strip()
+    amount = int(payload.amount)
+
+    if not phone or amount <= 0:
+        raise HTTPException(status_code=400, detail="Parametri non validi")
+
+    db = SessionLocal()
+    try:
+        user = topup_credits(db, phone, amount)
+        return {"ok": True, "phone": user.phone, "credits": user.credits}
     finally:
         db.close()
