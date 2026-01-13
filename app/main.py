@@ -1,6 +1,7 @@
 import os
 import json
 
+from .pdf_utils import extract_text_from_pdf_bytes, render_pdf_pages_to_images
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -10,7 +11,7 @@ from .models import Base, Request
 from .credits import get_or_create_user, ensure_can_spend, spend, COST_CREDITS
 from .ocr import ocr_image_bytes
 from .aiutami_prompt import SYSTEM_PROMPT
-
+from .pdf_utils import extract_text_from_pdf_bytes, render_pdf_pages_to_images
 
 DB_URL = os.getenv("AIUTAMI_DB_URL", "sqlite:///./aiutami.db")
 
@@ -48,7 +49,12 @@ async def analyze(
     image: UploadFile = File(...),
 ):
     # File guard
-    if image.content_type not in ("image/jpeg", "image/png", "image/jpg", "image/webp"):
+    if image.allowed = ("image/jpeg", "image/png", "image/jpg", "image/webp", "application/pdf")
+if image.content_type not in allowed:
+    raise HTTPException(
+        status_code=400,
+        detail="Formato non supportato. Invia una foto oppure un PDF."
+    )content_type not in ("image/jpeg", "image/png", "image/jpg", "image/webp"):
         raise HTTPException(status_code=400, detail="Formato non supportato. Invia una foto JPG/PNG.")
 
     img_bytes = await image.read()
@@ -68,7 +74,25 @@ async def analyze(
             return {"ok": False, "message": CREDITS_FINISHED_MSG, "credits": user.credits}
 
         # OCR
-        ocr_text = ocr_image_bytes(img_bytes)
+        ocr_text = # Estrazione testo: PDF-first, poi OCR
+ocr_text = ""
+
+if image.content_type == "application/pdf":
+    # 1) prova estrazione testo vero
+    ocr_text = extract_text_from_pdf_bytes(img_bytes, max_pages=3)
+
+    # 2) se è scansione, converti pagine in immagini e OCR
+    if len(ocr_text) < 30:
+        pages = render_pdf_pages_to_images(img_bytes, max_pages=2, dpi=220)
+        texts = []
+        for p in pages:
+            t = ocr_image_bytes(p)
+            if t and len(t) > 10:
+                texts.append(t)
+        ocr_text = "\n\n".join(texts).strip()
+else:
+    # immagine classica
+    ocr_text = ocr_image_bytes(img_bytes)ocr_image_bytes(img_bytes)
 
         # Se OCR troppo povero: non consumiamo credito
         if len(ocr_text) < 30:
